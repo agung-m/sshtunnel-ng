@@ -62,6 +62,9 @@ public class SshTunnelComposite extends Composite {
 	private static final String APPLICATION_VERSION = "v0.8";
 	private static final String APPLICATION_SITE = "github.com/agung-m/sshtunnel-ng";
 	private static final String APPLICATION_IMAGE_PATH = "/images/sshtunnel-ng.png";
+	// Same logo with the big circle green (connected) or red (reconnecting a lost session)
+	private static final String APPLICATION_CONNECTED_IMAGE_PATH = "/images/sshtunnel-ng-connected.png";
+	private static final String APPLICATION_RECONNECTING_IMAGE_PATH = "/images/sshtunnel-ng-reconnecting.png";
 	private static final String CONNECT_IMAGE_PATH = "/images/connect.png";
 	private static final String DISCONNECT_IMAGE_PATH = "/images/disconnect.png";
 	private static final String CONNECT_ALL_IMAGE_PATH = "/images/connect_all.png";
@@ -76,6 +79,10 @@ public class SshTunnelComposite extends Composite {
 	private Image disconnectAllImage;
 	private Image connectedImage;
 	private Image disconnectedImage;
+	// Application icon showing the connection status, for the taskbar and the tray
+	private Image appConnectedImage;
+	private Image appReconnectingImage;
+	private Image currentAppImage;
 
 	private Button connectButton;
 	private Button disconnectButton;
@@ -178,6 +185,29 @@ public class SshTunnelComposite extends Composite {
 		disconnectAllImage = loadImage(DISCONNECT_ALL_IMAGE_PATH);
 		connectedImage = loadImage(CONNECTED_IMAGE_PATH);
 		disconnectedImage = loadImage(DISCONNECTED_IMAGE_PATH);
+		appConnectedImage = loadImage(APPLICATION_CONNECTED_IMAGE_PATH);
+		appReconnectingImage = loadImage(APPLICATION_RECONNECTING_IMAGE_PATH);
+		currentAppImage = applicationImage;
+	}
+
+	/**
+	 * Green logo while any session is connected, red logo while a lost session is being reconnected
+	 * (takes precedence), normal logo otherwise.
+	 */
+	private void updateStatusImage() {
+		Image image = applicationImage;
+		if (SessionConnectionMonitor.getInstance().isReconnectingAny()) {
+			image = appReconnectingImage;
+		} else if (anyConnectedSessions()) {
+			image = appConnectedImage;
+		}
+		if (image != currentAppImage) {
+			currentAppImage = image;
+			shell.setImage(image);
+			if (trayItem != null) {
+				trayItem.setImage(image);
+			}
+		}
 	}
 
 	private Image loadImage(String path) {
@@ -463,6 +493,7 @@ public class SshTunnelComposite extends Composite {
 		sessionsComposite.updateTable();
 		tunnelsComposite.updateTable();
 		updateConnectButtons();
+		updateStatusImage();
 		stopProgressBar();
 	}
 
@@ -787,6 +818,8 @@ public class SshTunnelComposite extends Composite {
 		disconnectAllImage.dispose();
 		connectedImage.dispose();
 		disconnectedImage.dispose();
+		appConnectedImage.dispose();
+		appReconnectingImage.dispose();
 	}
 
 	/**

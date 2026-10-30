@@ -30,10 +30,10 @@ https://www.ssh.com/academy/ssh/tunneling
 
 ### Latest version
 
-* [Linux x86-64](https://github.com/agung-m/sshtunnel-ng/releases/download/0.7/sshtunnel-ng-0.7-dist-linux-64.zip)
-* [Windows 64-bit](https://github.com/agung-m/sshtunnel-ng/releases/download/0.7/sshtunnel-ng-0.7-dist-windows-64.zip)
-* [macOS x86-64](https://github.com/agung-m/sshtunnel-ng/releases/download/0.7/sshtunnel-ng-0.7-dist-mac-64.zip)
-* [macOS ARM64](https://github.com/agung-m/sshtunnel-ng/releases/download/0.7/sshtunnel-ng-0.7-dist-mac-aarch64.zip)
+* [Linux x86-64](https://github.com/njank/sshtunnel-ng/releases/download/0.8/sshtunnel-ng-0.8-dist-linux-64.zip)
+* [Windows 64-bit](https://github.com/njank/sshtunnel-ng/releases/download/0.8/sshtunnel-ng-0.8-dist-windows-64.zip)
+* [macOS x86-64](https://github.com/njank/sshtunnel-ng/releases/download/0.8/sshtunnel-ng-0.8-dist-mac-64.zip)
+* [macOS ARM64](https://github.com/njank/sshtunnel-ng/releases/download/0.8/sshtunnel-ng-0.8-dist-mac-aarch64.zip)
 
 ## Requirements
 

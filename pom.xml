@@ -3,7 +3,7 @@
 	<groupId>org.programmerplanet</groupId>
 	<artifactId>sshtunnel-ng</artifactId>
 	<name>sshtunel-ng</name>
-	<version>0.7</version>
+	<version>0.8</version>
 	<url>https://github.com/agung-m/sshtunnel-ng</url>
 	<developers>
 		<developer>

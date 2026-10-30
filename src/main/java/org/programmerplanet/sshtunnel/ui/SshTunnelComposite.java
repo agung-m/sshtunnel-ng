@@ -59,9 +59,12 @@ import org.programmerplanet.sshtunnel.model.Session;
 public class SshTunnelComposite extends Composite {
 
 	public static final String APPLICATION_TITLE = "SSH Tunnel NG";
-	private static final String APPLICATION_VERSION = "v0.7";
+	private static final String APPLICATION_VERSION = "v0.8";
 	private static final String APPLICATION_SITE = "github.com/agung-m/sshtunnel-ng";
 	private static final String APPLICATION_IMAGE_PATH = "/images/sshtunnel-ng.png";
+	// Same logo with the big circle green (connected) or red (reconnecting a lost session)
+	private static final String APPLICATION_CONNECTED_IMAGE_PATH = "/images/sshtunnel-ng-connected.png";
+	private static final String APPLICATION_RECONNECTING_IMAGE_PATH = "/images/sshtunnel-ng-reconnecting.png";
 	private static final String CONNECT_IMAGE_PATH = "/images/connect.png";
 	private static final String DISCONNECT_IMAGE_PATH = "/images/disconnect.png";
 	private static final String CONNECT_ALL_IMAGE_PATH = "/images/connect_all.png";
@@ -76,6 +79,10 @@ public class SshTunnelComposite extends Composite {
 	private Image disconnectAllImage;
 	private Image connectedImage;
 	private Image disconnectedImage;
+	// Application icon showing the connection status, for the taskbar and the tray
+	private Image appConnectedImage;
+	private Image appReconnectingImage;
+	private Image currentAppImage;
 
 	private Button connectButton;
 	private Button disconnectButton;
@@ -178,6 +185,29 @@ public class SshTunnelComposite extends Composite {
 		disconnectAllImage = loadImage(DISCONNECT_ALL_IMAGE_PATH);
 		connectedImage = loadImage(CONNECTED_IMAGE_PATH);
 		disconnectedImage = loadImage(DISCONNECTED_IMAGE_PATH);
+		appConnectedImage = loadImage(APPLICATION_CONNECTED_IMAGE_PATH);
+		appReconnectingImage = loadImage(APPLICATION_RECONNECTING_IMAGE_PATH);
+		currentAppImage = applicationImage;
+	}
+
+	/**
+	 * Green logo while any session is connected, red logo while a lost session is being reconnected
+	 * (takes precedence), normal logo otherwise.
+	 */
+	private void updateStatusImage() {
+		Image image = applicationImage;
+		if (SessionConnectionMonitor.getInstance().isReconnectingAny()) {
+			image = appReconnectingImage;
+		} else if (anyConnectedSessions()) {
+			image = appConnectedImage;
+		}
+		if (image != currentAppImage) {
+			currentAppImage = image;
+			shell.setImage(image);
+			if (trayItem != null) {
+				trayItem.setImage(image);
+			}
+		}
 	}
 
 	private Image loadImage(String path) {
@@ -212,6 +242,7 @@ public class SshTunnelComposite extends Composite {
 			}
 
 			public void sessionRemoved(Session session) {
+				SessionConnectionMonitor.getInstance().cancelReconnect(session);
 				updateConnectButtons();
 			}
 
@@ -462,14 +493,17 @@ public class SshTunnelComposite extends Composite {
 		sessionsComposite.updateTable();
 		tunnelsComposite.updateTable();
 		updateConnectButtons();
+		updateStatusImage();
 		stopProgressBar();
 	}
 
 	private void updateConnectButtons() {
 		connectButton.setEnabled(currentSession != null ? !ConnectionManager.getInstance().isConnected(currentSession) : false);
-		disconnectButton.setEnabled(currentSession != null ? ConnectionManager.getInstance().isConnected(currentSession) : false);
+		// Disconnect also stops the automatic reconnect of a lost session
+		disconnectButton.setEnabled(currentSession != null ? ConnectionManager.getInstance().isConnected(currentSession)
+				|| SessionConnectionMonitor.getInstance().isReconnecting(currentSession) : false);
 		connectAllButton.setEnabled(anyDisconnectedSessions());
-		disconnectAllButton.setEnabled(anyConnectedSessions());
+		disconnectAllButton.setEnabled(anyConnectedSessions() || SessionConnectionMonitor.getInstance().isReconnectingAny());
 	}
 
 	private boolean anyDisconnectedSessions() {
@@ -525,8 +559,6 @@ public class SshTunnelComposite extends Composite {
 				public void run() {
 						try {
 						ConnectionManager.getInstance().connect(session, shell);
-						// Put to monitored list
-						SessionConnectionMonitor.getInstance().addSession(session.getSessionName(), session);
 					} catch (ConnectionException ce) {
 						try {
 							ConnectionManager.getInstance().disconnect(session);
@@ -567,13 +599,25 @@ public class SshTunnelComposite extends Composite {
 //		messageBox.setMessage("Lost connection to " + session.getSessionName() + 
 //				" (" + session.getHostname() + ")");
 //		messageBox.open();
+		showTrayMessage(session, SWT.ICON_ERROR, "Connection to " + session.getHostname() + " has been lost. Reconnecting automatically...");
+	}
+
+	public void showReconnectedMessage(Session session) {
+		showTrayMessage(session, SWT.ICON_INFORMATION, "Connection to " + session.getHostname() + " has been restored.");
+	}
+
+	public void showReconnectFailedMessage(Session session, String reason) {
+		showTrayMessage(session, SWT.ICON_ERROR, "Stopped reconnecting to " + session.getHostname() + ": " + reason);
+	}
+
+	private void showTrayMessage(Session session, int icon, String message) {
 		if (trayItem != null && trayItem.getVisible()) {
-			ToolTip tip = new ToolTip(shell, SWT.BALLOON | SWT.ICON_ERROR);
+			ToolTip tip = new ToolTip(shell, SWT.BALLOON | icon);
 			//Rectangle trayRect = Display.getCurrent().getBounds();
 			//System.out.println(getLocation() + "," + trayRect);
 			//tip.setLocation(trayRect.width, trayRect.height-100);
 			tip.setText("Session: " + session.getSessionName());
-			tip.setMessage("Connection to "+ session.getHostname() + " has been lost.");
+			tip.setMessage(message);
 			trayItem.setToolTip(tip);
 			tip.setVisible(true);
 		}
@@ -593,9 +637,10 @@ public class SshTunnelComposite extends Composite {
 
 	private void disconnect(Session session) {
 		save();
-		if (session != null && ConnectionManager.getInstance().isConnected(session)) {
+		if (session != null) {
+			SessionConnectionMonitor.getInstance().cancelReconnect(session);
+			// Also when the connection has already died, so that its JSch session is not reused
 			ConnectionManager.getInstance().disconnect(session);
-			SessionConnectionMonitor.getInstance().removeSession(session.getSessionName());
 		}
 		connectionStatusChanged();
 	}
@@ -666,9 +711,8 @@ public class SshTunnelComposite extends Composite {
 		save();
 		for (Iterator<Session> i = configuration.getSessions().iterator(); i.hasNext();) {
 			Session session = i.next();
-			if (ConnectionManager.getInstance().isConnected(session)) {
-				ConnectionManager.getInstance().disconnect(session);
-			}
+			SessionConnectionMonitor.getInstance().cancelReconnect(session);
+			ConnectionManager.getInstance().disconnect(session);
 		}
 		connectionStatusChanged();
 	}
@@ -774,6 +818,8 @@ public class SshTunnelComposite extends Composite {
 		disconnectAllImage.dispose();
 		connectedImage.dispose();
 		disconnectedImage.dispose();
+		appConnectedImage.dispose();
+		appReconnectingImage.dispose();
 	}
 
 	/**

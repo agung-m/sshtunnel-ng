@@ -5,19 +5,23 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import com.jcraft.jsch.ServerSocketFactory;
 
+/**
+ * Creates the listening sockets of the local tunnels of one SSH connection and keeps track of
+ * them and of the connections they accept, so that they can all be closed.
+ */
 public class TrackedServerSocketFactory implements ServerSocketFactory {
 	private Map<String, ServerSocket> socketMap;
 	
 	public TrackedServerSocketFactory() {
-		this.socketMap = new HashMap<>();
+		this.socketMap = new ConcurrentHashMap<>();
 	}
 
 	@Override
@@ -34,19 +38,31 @@ public class TrackedServerSocketFactory implements ServerSocketFactory {
 			InetAddress bindAddr = InetAddress.getByName(normalize(addr));
 			
 			String key = bindAddr.toString() + ":" + Integer.toString(port);
-			ServerSocket socket = socketMap.get(key);
+			ServerSocket socket = socketMap.remove(key);
 			if (socket != null) {
-				CustomServerSocket customSocket = (CustomServerSocket) socket;
-				customSocket.closeTunnelSocket(bindAddr.toString(), port);
-				try {
-					customSocket.close();
-				} catch (IOException e) {
-					e.printStackTrace();
-				} finally {
-					socketMap.remove(key);
-				}
+				close((CustomServerSocket) socket);
 			}
 		} catch (UnknownHostException e) {
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * Closes all listening sockets of this factory and the connections they accepted.
+	 */
+	public void closeAll() {
+		for (Iterator<ServerSocket> i = socketMap.values().iterator(); i.hasNext();) {
+			ServerSocket socket = i.next();
+			i.remove();
+			close((CustomServerSocket) socket);
+		}
+	}
+
+	private void close(CustomServerSocket socket) {
+		socket.closeTunnelSockets();
+		try {
+			socket.close();
+		} catch (IOException e) {
 			e.printStackTrace();
 		}
 	}
@@ -65,37 +81,30 @@ public class TrackedServerSocketFactory implements ServerSocketFactory {
 
 class CustomServerSocket extends ServerSocket {
 
-	private Map<String, List<Socket>> tunnelSockets;
+	// Connections accepted by this tunnel, added by the JSch port watcher thread
+	private final List<Socket> tunnelSockets = new CopyOnWriteArrayList<>();
 	
 	public CustomServerSocket(int port, int backlog, InetAddress bindAddr) throws IOException {
 		super(port, backlog, bindAddr);
-		this.tunnelSockets = new ConcurrentHashMap<>();
 	}
 
 	@Override
 	public Socket accept() throws IOException {
 		Socket socket = super.accept();
-		String key = socket.getInetAddress().toString() + ":" + socket.getLocalPort();
-		
-		if (!tunnelSockets.containsKey(key))
-			tunnelSockets.put(key, new ArrayList<>());
-		tunnelSockets.get(key).add(socket);
-		
+		// Forget the connections that have ended, so the list does not grow forever
+		tunnelSockets.removeIf(Socket::isClosed);
+		tunnelSockets.add(socket);
 		return socket;
 	}
 	
-	public void closeTunnelSocket(String addr, int port) {
-		String key = addr + ":" + Integer.toString(port);
-		List<Socket> sockets = tunnelSockets.get(key);
-		if ((sockets != null) && (!sockets.isEmpty())) {
-			for (Socket socket: sockets) {
-				try {
-					socket.close();
-				} catch (IOException e) {
-					e.printStackTrace();
-				}
+	public void closeTunnelSockets() {
+		for (Socket socket: tunnelSockets) {
+			try {
+				socket.close();
+			} catch (IOException e) {
+				e.printStackTrace();
 			}
-			tunnelSockets.remove(key);
+			tunnelSockets.remove(socket);
 		}
 	}
 

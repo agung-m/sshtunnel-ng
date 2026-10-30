@@ -19,9 +19,12 @@ package org.programmerplanet.sshtunnel.model;
 import java.io.File;
 import java.io.IOException;
 import java.net.URISyntaxException;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.FileHandler;
 import java.util.logging.Logger;
 import java.util.logging.SimpleFormatter;
@@ -48,7 +51,13 @@ public class ConnectionManager {
 	private static final Log log = LogFactory.getLog(ConnectionManager.class);
 
 	private static final int TIMEOUT = 20000;
-	private static final int KEEP_ALIVE_INTERVAL = 40000;
+	// A keepalive is sent after 15s without traffic, and JSch drops the session after 3 unanswered
+	// ones. A dead connection is detected after about a minute instead of two.
+	private static final int KEEP_ALIVE_INTERVAL = 15000;
+	private static final int KEEP_ALIVE_COUNT_MAX = 3;
+	// On a live connection something arrives at least every KEEP_ALIVE_INTERVAL (the keepalive
+	// reply). If nothing arrived for this long, the connection is dead even if JSch did not notice.
+	private static final long STALL_TIMEOUT = 90000;
 	private static final String DEF_CIPHERS = "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-cbc,aes128-ctr";
 
 	private static final ConnectionManager INSTANCE = new ConnectionManager();
@@ -68,43 +77,65 @@ public class ConnectionManager {
 //		JSch.setLogger(new SshLogger("/tmp"));
 //	}
 
-	private TrackedServerSocketFactory serverSocketFactory = new TrackedServerSocketFactory();
-	
-	private Map<Session, com.jcraft.jsch.Session> connections = new HashMap<Session, com.jcraft.jsch.Session>();
+	// Accessed from the UI thread, the connect threads and the connection monitor
+	private final Map<Session, Connection> connections = new ConcurrentHashMap<Session, Connection>();
+	private final Set<Session> connecting = ConcurrentHashMap.newKeySet();
 
 	public void connect(Session session, Shell parent) throws ConnectionException {
-		log.info("Connecting session: " + session);
-		clearTunnelExceptions(session);
-		com.jcraft.jsch.Session jschSession = connections.get(session);
+		if (!connecting.add(session)) {
+			log.info("Session is already connecting: " + session);
+			return;
+		}
 		try {
-			if (jschSession == null) {
-				JSch jsch = new JSch();
-				File knownHosts = getKnownHostsFile();
-				jsch.setKnownHosts(knownHosts.getAbsolutePath());
-				
-				if (session.getIdentityPath() != null && session.getIdentityPath().trim().length() > 0) {
-					try {
-						if (session.getPassPhrase() != null && session.getPassPhrase().trim().length() > 0) {
-							jsch.addIdentity(session.getIdentityPath(), session.getPassPhrase());
-						} else {
-							jsch.addIdentity(session.getIdentityPath());
-						}
-					} catch (JSchException e) {
-						e.printStackTrace();
-						// Jsch does not support newer format, you may convert the key to the pem format:
-						// ssh-keygen -p -f key_file -m pem -P passphrase -N passphrase
-						//log.error("Invalid private key: " + session.getIdentityPath(), e);
-						throw new ConnectionException(e);
+			openConnection(session, parent);
+		} finally {
+			connecting.remove(session);
+		}
+	}
+
+	private void openConnection(Session session, Shell parent) throws ConnectionException {
+		log.info("Connecting session: " + session);
+		Connection existing = connections.get(session);
+		if (existing != null) {
+			if (existing.isConnected()) {
+				return;
+			}
+			// The connection died but was not cleaned up yet. Its JSch session must not be reused:
+			// JSch keeps the cipher state of the old connection, so the next handshake fails with
+			// "Packet corrupt". Every connect starts with a new JSch session.
+			closeConnection(session, existing);
+		}
+		clearTunnelExceptions(session);
+		Connection connection = null;
+		try {
+			JSch jsch = new JSch();
+			File knownHosts = getKnownHostsFile();
+			jsch.setKnownHosts(knownHosts.getAbsolutePath());
+
+			if (session.getIdentityPath() != null && session.getIdentityPath().trim().length() > 0) {
+				try {
+					if (session.getPassPhrase() != null && session.getPassPhrase().trim().length() > 0) {
+						jsch.addIdentity(session.getIdentityPath(), session.getPassPhrase());
+					} else {
+						jsch.addIdentity(session.getIdentityPath());
 					}
-				}
-				jschSession = jsch.getSession(session.getUsername(), session.getHostname(), session.getPort());
-				
-				// Set debug logger if set
-				if (session.getDebugLogPath() != null && session.getDebugLogPath().trim().length() > 0) {
-					jschSession.setLogger(new SshLogger(session.getDebugLogPath() 
-							+ File.separator + "sshtunnelng-" + session.getSessionName() + ".log"));
+				} catch (JSchException e) {
+					e.printStackTrace();
+					// Jsch does not support newer format, you may convert the key to the pem format:
+					// ssh-keygen -p -f key_file -m pem -P passphrase -N passphrase
+					//log.error("Invalid private key: " + session.getIdentityPath(), e);
+					throw new ConnectionException(e);
 				}
 			}
+			com.jcraft.jsch.Session jschSession = jsch.getSession(session.getUsername(), session.getHostname(), session.getPort());
+
+			// Set debug logger if set
+			if (session.getDebugLogPath() != null && session.getDebugLogPath().trim().length() > 0) {
+				jschSession.setLogger(new SshLogger(session.getDebugLogPath()
+						+ File.separator + "sshtunnelng-" + session.getSessionName() + ".log"));
+			}
+			connection = new Connection(jschSession);
+
 			UserInfo userInfo = null;
 			if (session.getPassword() != null && session.getPassword().trim().length() > 0) {
 				userInfo = new DefaultUserInfo(parent, session.getPassword());
@@ -114,7 +145,7 @@ public class ConnectionManager {
 			
 			jschSession.setUserInfo(userInfo);
 			jschSession.setServerAliveInterval(KEEP_ALIVE_INTERVAL);
-			jschSession.setServerAliveCountMax(2);
+			jschSession.setServerAliveCountMax(KEEP_ALIVE_COUNT_MAX);
 			
 			if (session.getCiphers() != null && !session.getCiphers().isEmpty()) {
 				// Set ciphers to use aes128-gcm if possible, as it is fast on many systems
@@ -131,13 +162,14 @@ public class ConnectionManager {
 		    
 			jschSession.connect(TIMEOUT);
 
-			startTunnels(session, jschSession);
+			startTunnels(session, connection);
 		} catch (JSchException e) {
-			jschSession.disconnect();
-			jschSession = null;
+			if (connection != null) {
+				connection.close();
+			}
 			throw new ConnectionException(e);
 		}
-		connections.put(session, jschSession);
+		connections.put(session, connection);
 	}
 
 	private File getKnownHostsFile() {
@@ -148,11 +180,11 @@ public class ConnectionManager {
 		return f;
 	}
 
-	private void startTunnels(Session session, com.jcraft.jsch.Session jschSession) {
+	private void startTunnels(Session session, Connection connection) {
 		for (Iterator<Tunnel> i = session.getTunnels().iterator(); i.hasNext();) {
 			Tunnel tunnel = i.next();
 			try {
-				startTunnel(jschSession, tunnel);
+				startTunnel(connection, tunnel);
 			} catch (Exception e) {
 				tunnel.setException(e);
 				log.error("Error starting tunnel: " + tunnel, e);
@@ -160,12 +192,13 @@ public class ConnectionManager {
 		}
 	}
 
-	private void startTunnel(com.jcraft.jsch.Session jschSession, Tunnel tunnel) throws JSchException {
+	private void startTunnel(Connection connection, Tunnel tunnel) throws JSchException {
+		com.jcraft.jsch.Session jschSession = connection.jschSession;
 		if (tunnel.getLocal()) {
 			//jschSession.setPortForwardingL(tunnel.getLocalAddress(), tunnel.getLocalPort(), tunnel.getRemoteAddress(), tunnel.getRemotePort());
 			jschSession.setPortForwardingL(tunnel.getLocalAddress(),
 					tunnel.getLocalPort(), tunnel.getRemoteAddress(),
-					tunnel.getRemotePort(), serverSocketFactory);
+					tunnel.getRemotePort(), connection.serverSocketFactory);
 		} else {
 			jschSession.setPortForwardingR(tunnel.getRemoteAddress(), tunnel.getRemotePort(), tunnel.getLocalAddress(), tunnel.getLocalPort());
 		}
@@ -173,19 +206,19 @@ public class ConnectionManager {
 	
 	private int updateTunnelIfSessionConnected(Session session, TunnelUpdateState state, Tunnel tunnel, Tunnel prevTunnel) {
 		int status = 0;
-		com.jcraft.jsch.Session jschSession = connections.get(session);
-		if (jschSession != null && jschSession.isConnected()) {
+		Connection connection = connections.get(session);
+		if (connection != null && connection.isConnected()) {
 			try {
 				switch (state) {
 				case START:
-					startTunnel(jschSession, tunnel);
+					startTunnel(connection, tunnel);
 					break;
 				case STOP:
-					stopTunnel(jschSession, tunnel);
+					stopTunnel(connection, tunnel);
 					break;
 				default:
-					stopTunnel(jschSession, prevTunnel);
-					startTunnel(jschSession, tunnel);
+					stopTunnel(connection, prevTunnel);
+					startTunnel(connection, tunnel);
 					break;
 				}
 			} catch (JSchException e) {
@@ -208,34 +241,53 @@ public class ConnectionManager {
 		return updateTunnelIfSessionConnected(session, TunnelUpdateState.CHANGE, tunnel, prevTunnel);
 	}
 
+	/**
+	 * Closes the connection of the session, also when it has already died, so that the next
+	 * connect starts from scratch.
+	 */
 	public void disconnect(Session session) {
-		log.info("Disconnecting session: " + session);
 		clearTunnelExceptions(session);
-		com.jcraft.jsch.Session jschSession = connections.get(session);
-		if (jschSession != null) {
-			stopTunnels(session, jschSession);
-			jschSession.disconnect();
+		Connection connection = connections.remove(session);
+		if (connection != null) {
+			log.info("Disconnecting session: " + session);
+			connection.close();
 		}
-		connections.remove(session);
 	}
 
-	private void stopTunnels(Session session, com.jcraft.jsch.Session jschSession) {
-		for (Iterator<Tunnel> i = session.getTunnels().iterator(); i.hasNext();) {
-			Tunnel tunnel = i.next();
-			try {
-				stopTunnel(jschSession, tunnel);
-			} catch (Exception e) {
-				log.error("Error stopping tunnel: " + tunnel, e);
+	/**
+	 * Closes the connections that died without being disconnected (e.g. network loss) and returns
+	 * their sessions.
+	 */
+	public List<Session> closeDeadConnections() {
+		List<Session> lostSessions = new ArrayList<Session>();
+		for (Map.Entry<Session, Connection> entry : connections.entrySet()) {
+			Connection connection = entry.getValue();
+			if (!connection.isConnected() && closeConnection(entry.getKey(), connection)) {
+				log.warn("Session " + entry.getKey().getSessionName() + " has disconnected.");
+				lostSessions.add(entry.getKey());
 			}
 		}
+		return lostSessions;
 	}
 
-	private void stopTunnel(com.jcraft.jsch.Session jschSession, Tunnel tunnel) throws JSchException {
+	private boolean closeConnection(Session session, Connection connection) {
+		// Remove only this connection, a concurrent connect may already have registered a new one
+		if (connections.remove(session, connection)) {
+			connection.close();
+			return true;
+		}
+		return false;
+	}
+
+	private void stopTunnel(Connection connection, Tunnel tunnel) throws JSchException {
 		if (tunnel.getLocal()) {
-			jschSession.delPortForwardingL(tunnel.getLocalAddress(), tunnel.getLocalPort());
-			serverSocketFactory.closeSocket(tunnel.getLocalAddress(), tunnel.getLocalPort());
+			try {
+				connection.jschSession.delPortForwardingL(tunnel.getLocalAddress(), tunnel.getLocalPort());
+			} finally {
+				connection.serverSocketFactory.closeSocket(tunnel.getLocalAddress(), tunnel.getLocalPort());
+			}
 		} else {
-			jschSession.delPortForwardingR(tunnel.getRemotePort());
+			connection.jschSession.delPortForwardingR(tunnel.getRemotePort());
 		}
 	}
 
@@ -247,18 +299,18 @@ public class ConnectionManager {
 	}
 
 	public boolean isConnected(Session session) {
-		com.jcraft.jsch.Session jschSession = connections.get(session);
-		return jschSession != null && jschSession.isConnected();
+		Connection connection = connections.get(session);
+		return connection != null && connection.isConnected();
 	}
 	
 	public Exception getSessionException(Session session) {
 		// Currently use keepAliveMsg
 		//boolean hasError = false;
 		Exception err = null;
-		com.jcraft.jsch.Session jschSession = connections.get(session);
-		if (jschSession != null ) {//&& !jschSession.isConnected()) {
+		Connection connection = connections.get(session);
+		if (connection != null ) {//&& !jschSession.isConnected()) {
 			try {
-				ChannelExec testChannel = (ChannelExec) jschSession.openChannel("exec");
+				ChannelExec testChannel = (ChannelExec) connection.jschSession.openChannel("exec");
 				testChannel.setCommand("true");
 				testChannel.connect();
 				testChannel.disconnect();
@@ -271,7 +323,37 @@ public class ConnectionManager {
 		}
 		return err;
 	}
-	
+
+	/**
+	 * One SSH connection of a session: a new JSch session plus the sockets it uses.
+	 */
+	private static class Connection {
+
+		final com.jcraft.jsch.Session jschSession;
+		final TrackedSocketFactory socketFactory = new TrackedSocketFactory(TIMEOUT);
+		final TrackedServerSocketFactory serverSocketFactory = new TrackedServerSocketFactory();
+
+		Connection(com.jcraft.jsch.Session jschSession) {
+			this.jschSession = jschSession;
+			jschSession.setSocketFactory(socketFactory);
+		}
+
+		boolean isConnected() {
+			// JSch notices a dead link through its keepalives, unless its threads are stuck writing to
+			// the dead socket (full TCP send buffer). Then nothing is received any more at all.
+			return jschSession.isConnected() && !socketFactory.isSilentFor(STALL_TIMEOUT);
+		}
+
+		void close() {
+			// Close the TCP connection first. On a dead link JSch threads can be stuck writing to it
+			// while holding the session lock, and jschSession.disconnect() would wait for them (on the
+			// UI thread). Closing the socket makes those writes fail right away.
+			socketFactory.closeSocket();
+			jschSession.disconnect();
+			serverSocketFactory.closeAll();
+		}
+	}
+
 }
 
 class SshLogger implements com.jcraft.jsch.Logger {
